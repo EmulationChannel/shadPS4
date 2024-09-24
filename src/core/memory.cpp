@@ -51,6 +51,35 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size) {
              total_flexible_size, total_direct_size);
 }
 
+PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, size_t size, u64 alignment) {
+    std::scoped_lock lk{mutex};
+
+    auto dmem_area = FindDmemArea(search_start);
+
+    const auto is_suitable = [&] {
+        const auto aligned_base = alignment > 0 ? Common::AlignUp(dmem_area->second.base, alignment)
+                                                : dmem_area->second.base;
+        const auto alignment_size = aligned_base - dmem_area->second.base;
+        const auto remaining_size =
+            dmem_area->second.size >= alignment_size ? dmem_area->second.size - alignment_size : 0;
+        return dmem_area->second.is_free && remaining_size >= size;
+    };
+    while (!is_suitable() && dmem_area->second.GetEnd() <= search_end) {
+        dmem_area++;
+    }
+    ASSERT_MSG(is_suitable(), "Unable to find free direct memory area: size = {:#x}", size);
+
+    // Align free position
+    PAddr free_addr = dmem_area->second.base;
+    free_addr = alignment > 0 ? Common::AlignUp(free_addr, alignment) : free_addr;
+
+    // Add the allocated region to the list and commit its pages.
+    auto& area = CarveDmemArea(free_addr, size)->second;
+    area.is_free = false;
+    area.is_pooled = true;
+    return free_addr;
+}
+
 PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, size_t size, u64 alignment,
                               int memory_type) {
     std::scoped_lock lk{mutex};
@@ -112,6 +141,43 @@ void MemoryManager::Free(PAddr phys_addr, size_t size) {
     MergeAdjacent(dmem_map, dmem_area);
 }
 
+int MemoryManager::PoolReserve(void** out_addr, VAddr virtual_addr, size_t size, MemoryMapFlags flags,
+                                u64 alignment) {
+    std::scoped_lock lk{mutex};
+
+    virtual_addr = (virtual_addr == 0) ? impl.SystemManagedVirtualBase() : virtual_addr;
+    alignment = alignment > 0 ? alignment : 2_MB;
+    VAddr mapped_addr = alignment > 0 ? Common::AlignUp(virtual_addr, alignment) : virtual_addr;
+
+    // Fixed mapping means the virtual address must exactly match the provided one.
+    if (True(flags & MemoryMapFlags::Fixed)) {
+        const auto& vma = FindVMA(mapped_addr)->second;
+        // If the VMA is mapped, unmap the region first.
+        if (vma.IsMapped()) {
+            UnmapMemoryImpl(mapped_addr, size);
+        }
+        const size_t remaining_size = vma.base + vma.size - mapped_addr;
+        ASSERT_MSG(vma.type == VMAType::Free && remaining_size >= size);
+    }
+
+    // Find the first free area starting with provided virtual address.
+    if (False(flags & MemoryMapFlags::Fixed)) {
+        mapped_addr = SearchFree(mapped_addr, size, alignment);
+    }
+
+    // Add virtual memory area
+    const auto new_vma_handle = CarveVMA(mapped_addr, size);
+    auto& new_vma = new_vma_handle->second;
+    new_vma.disallow_merge = True(flags & MemoryMapFlags::NoCoalesce);
+    new_vma.prot = MemoryProt::NoAccess;
+    new_vma.name = "";
+    new_vma.type = VMAType::PoolReserved;
+    MergeAdjacent(vma_map, new_vma_handle);
+
+    *out_addr = std::bit_cast<void*>(mapped_addr);
+    return ORBIS_OK;
+}
+
 int MemoryManager::Reserve(void** out_addr, VAddr virtual_addr, size_t size, MemoryMapFlags flags,
                            u64 alignment) {
     std::scoped_lock lk{mutex};
@@ -146,6 +212,36 @@ int MemoryManager::Reserve(void** out_addr, VAddr virtual_addr, size_t size, Mem
     MergeAdjacent(vma_map, new_vma_handle);
 
     *out_addr = std::bit_cast<void*>(mapped_addr);
+    return ORBIS_OK;
+}
+
+int MemoryManager::PoolCommit(VAddr virtual_addr, size_t size, MemoryProt prot) {
+    std::scoped_lock lk{mutex};
+
+    const u64 alignment = 64_KB;
+
+    // When virtual addr is zero, force it to virtual_base. The guest cannot pass Fixed
+    // flag so we will take the branch that searches for free (or reserved) mappings.
+    virtual_addr = (virtual_addr == 0) ? impl.SystemManagedVirtualBase() : virtual_addr;
+    VAddr mapped_addr = Common::AlignUp(virtual_addr, alignment);
+
+    // This should return SCE_KERNEL_ERROR_ENOMEM but shouldn't normally happen.
+    const auto& vma = FindVMA(mapped_addr)->second;
+    const size_t remaining_size = vma.base + vma.size - mapped_addr;
+    ASSERT_MSG(!vma.IsMapped() && remaining_size >= size);
+
+    // Perform the mapping.
+    void* out_addr = impl.Map(mapped_addr, size, alignment, -1, false);
+    TRACK_ALLOC(out_addr, size, "VMEM");
+
+    auto& new_vma = CarveVMA(mapped_addr, size)->second;
+    new_vma.disallow_merge = false;
+    new_vma.prot = prot;
+    new_vma.name = "";
+    new_vma.type = Core::VMAType::Pooled;
+    new_vma.is_exec = false;
+    new_vma.phys_base = -1;
+
     return ORBIS_OK;
 }
 
